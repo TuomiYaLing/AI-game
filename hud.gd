@@ -97,6 +97,7 @@ func _draw() -> void:
 		_draw_items(vs)
 		_draw_skills(vs)
 		_draw_weapons(vs)
+		_draw_boss_bar(vs)
 		_draw_minimap(vs)
 		_draw_banner(vs)
 		_draw_toasts(vs)
@@ -217,6 +218,40 @@ func _fmt_mult(m: float) -> String:
 		return "%d" % int(m)
 	return "%d" % int(m)
 
+
+## 王级 BOSS 血条（装备栏上方，最多同时显示 3 条，需打到后才显现）
+func _draw_boss_bar(vs: Vector2) -> void:
+	if game.boss_refs == null:
+		return
+	var shown: int = 0
+	for i in range(game.boss_refs.size()):
+		if shown >= 3:
+			break
+		var b = game.boss_refs[i]
+		if b == null or not is_instance_valid(b) or bool(b.dead):
+			continue
+		if not game.boss_seen_ids.has(b.get_instance_id()):
+			continue
+		var w: float = 380.0
+		var h: float = 20.0
+		var x: float = vs.x * 0.5 - w * 0.5
+		var y: float = vs.y - 78.0 - 20.0 - 44.0 - float(shown) * 34.0
+		var mx: float = maxf(1.0, float(b.max_hp))
+		var ratio: float = clampf(float(b.hp) / mx, 0.0, 1.0)
+		draw_rect(Rect2(x - 3.0, y - 3.0, w + 6.0, h + 6.0), Color(0.03, 0.03, 0.05, 0.82))
+		draw_rect(Rect2(x, y, w, h), Color(0.22, 0.06, 0.08))
+		var fill: Color = Color(0.92, 0.24, 0.30)
+		if ratio <= 0.3:
+			fill = Color(1.0, 0.45, 0.20)
+		draw_rect(Rect2(x, y, w * ratio, h), fill)
+		draw_rect(Rect2(x, y, w * ratio, 4.0), Color(1.0, 0.55, 0.55, 0.5))
+		for k in range(1, 10):
+			draw_rect(Rect2(x + w * float(k) / 10.0, y, 1.0, h), Color(0.0, 0.0, 0.0, 0.35))
+		draw_rect(Rect2(x - 3.0, y - 3.0, w + 6.0, 2.0), Color(0.68, 0.48, 0.36, 0.55))
+		txt(Vector2(x + 6.0, y + h - 4.0), "%d / %d" % [int(b.hp), int(mx)], 13, Color(1, 0.92, 0.92, 0.88))
+		txt(Vector2(x - 12.0, y + h - 4.0), "王级 · " + str(game.boss_display_name(b)), 16, Color(1.0, 0.80, 0.55), 2)
+		txt(Vector2(x + w + 12.0, y + h - 4.0), "%d%%" % int(ratio * 100.0), 14, Color(1.0, 0.86, 0.78), 0)
+		shown += 1
 
 func _fmt_time(t: float) -> String:
 	var total: int = int(t)
@@ -541,6 +576,11 @@ func _draw_tp_prompt(vs: Vector2) -> void:
 		if pp0.distance_to(game.player.position + Vector2(0, -20.0)) <= 96.0:
 			var ps0: Vector2 = pp0 - cam + vs * 0.5
 			txt(Vector2(ps0.x, ps0.y - 80.0), "按 F / 回车（手柄 Y）进入下一关", 14, Color(0.65, 1.0, 0.78), 1)
+	# 地上装备 / 遗物：交互键拾取提示
+	if int(game.near_drop_idx) >= 0:
+		var nd: Vector2 = game.near_drop_pos
+		var nsc: Vector2 = nd - cam + vs * 0.5
+		txt(Vector2(nsc.x, nsc.y - 46.0), "按 F（手柄 Y）拾取", 14, Color(1.0, 0.92, 0.55), 1)
 	for i in range(game.dungeon.teleporters.size()):
 		var tp: Dictionary = game.dungeon.teleporters[i]
 		var tpw: Vector2 = tp["pos"]
@@ -679,7 +719,7 @@ func _draw_shop(vs: Vector2) -> void:
 	var by: float = vs.y * 0.5 - h * 0.5
 	panel(Rect2(bx, by, w, h), 0.86)
 	txt(Vector2(vs.x * 0.5, by + 44.0), "金 币 商 店 · 强 化", 30, Color(0.94, 0.90, 0.82), 1)
-	txt(Vector2(vs.x * 0.5, by + 70.0), "第 %d 层已通过 · 下一层怪物强度 ×%s" % [game.floor_index, _fmt_mult(game.stat_mult() * 2.0)], 14, Color(0.72, 0.68, 0.62), 1)
+	txt(Vector2(vs.x * 0.5, by + 70.0), "第 %d 层已通过 · 下一层怪物强度 ×%s" % [game.floor_index, _fmt_mult(game.stat_mult() * 5.0)], 14, Color(0.72, 0.68, 0.62), 1)
 
 	# 金币
 	draw_circle(Vector2(vs.x * 0.5 - 44.0, by + 102.0), 8.0, Color(0.95, 0.78, 0.30))
@@ -1004,7 +1044,7 @@ func _draw_saves(vs: Vector2) -> void:
 		txt(Vector2(px + 22.0, sy + 62.0), "装备：%s / %s / %s" % [W.sword_name(sw), W.gun_name(rg), W.shield_name(sh)], 15, Color(0.74, 0.80, 0.90))
 		txt(Vector2(px + 22.0, sy + 84.0), "保存于 %s    累计游玩 %s" % [str(d.get("saved_at", "-")), _fmt_clock(played)], 12, Color(0.52, 0.54, 0.60))
 
-	txt(Vector2(vs.x * 0.5, vs.y - 92.0), "↑↓ 选择槽位      Enter 读取      S / F5 保存到该槽      Del 删除      Esc 返回", 15, Color(0.86, 0.86, 0.90), 1)
+	txt(Vector2(vs.x * 0.5, vs.y - 92.0), "↑↓ 选择槽位      Enter 读取      F5 保存到该槽      Del 删除      Esc 返回", 15, Color(0.86, 0.86, 0.90), 1)
 	txt(Vector2(vs.x * 0.5, vs.y - 66.0), "手柄：十字键选择    A 读取    Y 保存    B 返回", 13, Color(0.62, 0.80, 0.95), 1)
 	if game.menu_msg != "":
 		txt(Vector2(vs.x * 0.5, vs.y - 62.0), str(game.menu_msg), 15, Color(0.85, 0.95, 1.0), 1)
@@ -1016,7 +1056,13 @@ func _draw_saves(vs: Vector2) -> void:
 func settings_row_rect(i: int, vs: Vector2) -> Rect2:
 	var pw: float = 760.0
 	var px: float = vs.x * 0.5 - pw * 0.5
-	return Rect2(px, 130.0 + float(i) * 52.0, pw, 46.0)
+	var row: int = i - int(game.settings_top)
+	return Rect2(px, 130.0 + float(row) * 52.0, pw, 46.0)
+
+
+## 设置界面一屏能放几行（用于滚轮 / 十字键滚动）
+func settings_rows_visible(vs: Vector2) -> int:
+	return maxi(3, int((vs.y - 200.0) / 52.0))
 
 
 func slot_rect(i: int, vs: Vector2) -> Rect2:
@@ -1047,8 +1093,13 @@ func _draw_settings(vs: Vector2) -> void:
 
 	var labels: Array = ["音效音量", "屏幕震动", "全屏显示", "分辨率", "帧率上限", "显示帧数", "画面质量", "显示准星", "按键 / 手柄设置", "自动瞄准", "摇杆瞄准", "准星瞄准", "自定义按键", "退出游戏"]
 	var s: Dictionary = game.settings
-	for i in range(labels.size()):
-		var r: Rect2 = settings_row_rect(i, vs)
+	var top: int = int(game.settings_top)
+	var vis: int = settings_rows_visible(vs)
+	for row in range(vis):
+		var i: int = top + row
+		if i >= labels.size():
+			break
+		var r: Rect2 = Rect2(vs.x * 0.5 - 380.0, 130.0 + float(row) * 52.0, 760.0, 46.0)
 		var sel: bool = i == int(game.settings_index)
 		var quit_row: bool = i == 13
 		var bg: Color = Color(0.10, 0.13, 0.20, 0.95) if sel else Color(0.05, 0.06, 0.09, 0.9)
