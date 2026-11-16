@@ -1,0 +1,698 @@
+extends Node2D
+## 随机地牢：生成 + 瓦片碰撞 + 绘制
+## 每次死亡都会用新的种子重新生成，构造完全不同。
+
+const Art = preload("res://scripts/art.gd")
+const TILE := 32
+
+const ITEM_POOL := ["sword", "sword", "halo", "halo", "book", "book", "pet", "stand"]
+const ITEM_COLS := {
+	"sword": Color(0.72, 0.94, 1.0),
+	"halo": Color(1.0, 0.86, 0.42),
+	"book": Color(0.62, 0.80, 1.0),
+	"pet": Color(1.0, 0.55, 0.32),
+	"stand": Color(0.76, 0.58, 1.0),
+}
+
+const SMALL_KINDS := ["slime", "zombie", "goblin", "skeleton", "flesh"]
+const ELEM_SLIME_KINDS := ["slime_blue", "slime_red", "slime_metal", "slime_wood", "slime_earth"]
+
+var floor_index := 1
+var seed_value := 0
+var theme_idx := 1
+var theme: Dictionary = {}
+var width_tiles := 180
+var height_tiles := 46
+var tiles := PackedByteArray()
+var rooms: Array = []
+var enemy_spawns: Array = []
+var props: Array = []
+var loots: Array = []
+var item_drops: Array = []
+var chests: Array = []
+var torch_glows: Array = []
+var spawn_point := Vector2.ZERO
+var portal_point := Vector2.ZERO
+var portal_open := false
+var total_enemies := 0
+var cam_pos := Vector2.ZERO
+var view_size := Vector2(1280, 720)
+var time := 0.0
+
+var count_mult := 1
+var glow_on := true
+var layout := "snake"
+var training := false
+var wall_on := false
+var train_pedestals: Array = []
+var dummy_point := Vector2.ZERO
+var train_len := 120
+var teleporters: Array = []
+var visited: Array = []
+var band_count := 1
+var band_rooms: Array = []
+var band_first: Array = []
+var band_last: Array = []
+var rng := RandomNumberGenerator.new()
+
+
+func _init(p_floor: int = 1, p_seed: int = 12345, p_count_mult: int = 1, p_training: bool = false, p_train_len: int = 120) -> void:
+	floor_index = p_floor
+	seed_value = p_seed
+	count_mult = maxi(1, p_count_mult)
+	training = p_training
+	train_len = maxi(40, p_train_len)
+	theme_idx = ((p_floor - 1) % Art.THEMES.size()) + 1
+	theme = Art.theme(p_floor)
+	rng.seed = p_seed
+	generate()
+
+
+# ---------------------------------------------------------------- 生成
+func generate() -> void:
+	if training:
+		_generate_training()
+		return
+	teleporters.clear()
+	visited.clear()
+	width_tiles = 168 + mini(floor_index, 30) * 10
+	var lay: String = str(theme.get("layout", "snake"))
+	layout = lay
+	band_count = clampi(2 + int(floor_index / 4), 2, 4)
+	if lay == "tower":
+		band_count += 1
+	elif lay == "hall":
+		band_count = maxi(2, band_count - 1)
+	band_count = clampi(band_count, 2, 5)
+	height_tiles = 26 + band_count * 16
+	tiles.resize(width_tiles * height_tiles)
+	tiles.fill(Art.ROCK)
+	rooms.clear()
+	band_rooms.clear()
+	band_first.clear()
+	band_last.clear()
+	enemy_spawns.clear()
+	props.clear()
+	loots.clear()
+	item_drops.clear()
+	chests.clear()
+	torch_glows.clear()
+
+	var band_h: int = int(float(height_tiles) / float(band_count))
+	for band in range(band_count):
+		var bot: int = height_tiles - band * band_h - 4
+		var top: int = height_tiles - (band + 1) * band_h + 4
+		var dir: int = 1 if band % 2 == 0 else -1
+		_generate_band(band, dir, top, bot)
+
+	var min_links: int = 2
+	if lay == "tower":
+		min_links = 3
+	for band in range(band_count - 1):
+		_link_bands(band, band + 1, min_links)
+		# 随机纵向捷径：形成回路，避免死路
+		if rng.randf() < 0.6:
+			_link_bands(band, band + 1, 1)
+
+	if rooms.size() < 3:
+		var fb_floor: int = height_tiles - 12
+		var fb := Rect2i(3, fb_floor - 9, width_tiles - 8, 9)
+		_carve_room(fb, fb_floor)
+		var fb_info := {"rect": fb, "floor": fb_floor, "band": 0}
+		rooms = [fb_info]
+		band_rooms = [[fb_info]]
+		band_first = [fb_info]
+		band_last = [fb_info]
+		band_count = 1
+
+	for i in range(rooms.size()):
+		var info: Dictionary = rooms[i]
+		_decorate_room(info["rect"], int(info["floor"]), i)
+
+	var shafts: int = rng.randi_range(1, 2 + int(floor_index / 3))
+	for i in range(shafts):
+		if rooms.size() < 3:
+			break
+		var idx: int = rng.randi_range(1, rooms.size() - 2)
+		_carve_shaft(rooms[idx])
+
+	var first: Dictionary = band_first[0]
+	var first_rect: Rect2i = first["rect"]
+	var scx: int = first_rect.position.x + int(first_rect.size.x / 2)
+	var sfy: int = int(first["floor"])
+	scx = _find_solid_column(first_rect, sfy, scx)
+	spawn_point = Vector2(float(scx) * TILE + 16.0, float(sfy * TILE))
+	var last: Dictionary = band_last[band_last.size() - 1]
+	var last_rect: Rect2i = last["rect"]
+	var portal_idx: int = rooms.size() - 1
+	if rooms.size() >= 6:
+		var half_i: int = int(rooms.size() / 2)
+		if rng.randf() < 0.65:
+			portal_idx = rng.randi_range(half_i, rooms.size() - 2)
+	var pr: Rect2i = rooms[portal_idx]["rect"]
+	var pfy: int = int(rooms[portal_idx]["floor"])
+	var pcx: int = pr.position.x + rng.randi_range(2, maxi(2, pr.size.x - 3))
+	pcx = _find_solid_column(pr, pfy, pcx)
+	portal_point = Vector2(float(pcx) * TILE, float(pfy * TILE))
+
+	var chest_count: int = 2 + rng.randi_range(0, 1) + int(floor_index / 5) + band_count - 1
+	for i in range(chest_count):
+		if rooms.size() < 3:
+			break
+		var cidx: int = rng.randi_range(1, rooms.size() - 1)
+		var crc: Rect2i = rooms[cidx]["rect"]
+		var cfy2: int = int(rooms[cidx]["floor"])
+		var cx2: float = float(crc.position.x + rng.randi_range(2, max(2, crc.size.x - 3))) * TILE + 16.0
+		chests.append({"pos": Vector2(cx2, float(cfy2 * TILE)), "opened": false, "seed": rng.randf()})
+
+	_spawn_legacy_enemies()
+	_place_random_teleporters()
+
+
+## （保留的新版生成函数，未被调用）
+func _spawn_enemies(base_total: int) -> void:
+	total_enemies = 0
+	enemy_spawns.clear()
+	var floor_total: int = mini(350, maxi(4, base_total))
+	if rooms.size() < 2:
+		return
+	var per_room: int = maxi(1, int(ceil(float(floor_total) / float(rooms.size() - 1))))
+	for i in range(1, rooms.size()):
+		var info2: Dictionary = rooms[i]
+		var rc: Rect2i = info2["rect"]
+		var rfy: int = int(info2["floor"])
+		var count: int = per_room
+		for k in range(count):
+			if total_enemies >= floor_total:
+				break
+			var ex: float = float(rc.position.x + rng.randi_range(1, maxi(1, rc.size.x - 2))) * TILE + 16.0
+			var kind: String = _pick_kind()
+			enemy_spawns.append({"pos": Vector2(ex, float(rfy * TILE)), "kind": kind, "elite": false})
+			total_enemies += 1
+		if total_enemies >= floor_total:
+			break
+
+
+func _pick_kind() -> String:
+	var roll: float = rng.randf()
+	if floor_index >= 5 and roll < 0.30:
+		return str(ELEM_SLIME_KINDS[rng.randi_range(0, ELEM_SLIME_KINDS.size() - 1)])
+	return str(SMALL_KINDS[rng.randi_range(0, SMALL_KINDS.size() - 1)])
+
+
+func _generate_band(band: int, dir: int, top: int, bot: int) -> void:
+	var n: int = 5 + rng.randi_range(0, 2)
+	var span: int = bot - top
+	var prev_rect := Rect2i()
+	var prev_floor: int = 0
+	var room_list: Array = []
+	var x: int = 5
+	if dir < 0:
+		x = width_tiles - 30
+	var y_mid: int = top + int(float(span) * 0.55)
+	for i in range(n):
+		var w: int = rng.randi_range(22, 38)
+		var h: int = rng.randi_range(10, 16)
+		var rx: int = clampi(x, 3, maxi(3, width_tiles - w - 3))
+		var base_y: int = y_mid if i % 2 == 0 else (top + int(float(span) * 0.22))
+		var ry: int = clampi(base_y - h, top, maxi(top, bot - h))
+		var rc := Rect2i(rx, ry, w, h)
+		_carve_room(rc, ry + h)
+		if prev_rect.size.x > 0:
+			var cy: int = maxi(prev_floor, ry + h) - 3
+			var x0: int = mini(prev_rect.position.x + prev_rect.size.x, rc.position.x)
+			var x1: int = maxi(prev_rect.position.x, rc.position.x + rc.size.x)
+			for tx in range(clampi(x0, 1, width_tiles - 2), clampi(x1, 1, width_tiles - 2)):
+				for dy in range(0, 5):
+					var ty2: int = clampi(cy - dy, 1, height_tiles - 2)
+					tiles[ty2 * width_tiles + tx] = Art.AIR
+				var fy2: int = clampi(cy + 1, 1, height_tiles - 1)
+				if tiles[fy2 * width_tiles + tx] == Art.AIR:
+					tiles[fy2 * width_tiles + tx] = Art.ROCK
+		var info := {"rect": rc, "floor": ry + h, "band": band}
+		rooms.append(info)
+		room_list.append(info)
+		prev_rect = rc
+		prev_floor = ry + h
+		x += dir * (w + rng.randi_range(2, 6))
+	band_rooms.append(room_list)
+	if room_list.size() > 0:
+		band_first.append(room_list[0])
+		band_last.append(room_list[room_list.size() - 1])
+	else:
+		band_first.append({})
+		band_last.append({})
+
+## 窄通道：连接同一层的两间房（3 格高 + 实心地板），像原版那样"钻洞"
+func _carve_corridor(a: Rect2i, a_floor: int, b: Rect2i, b_floor: int) -> void:
+	var x0: int = a.position.x + a.size.x
+	var x1: int = b.position.x
+	if x1 < x0:
+		x0 = b.position.x + b.size.x
+		x1 = a.position.x
+	if x1 < x0:
+		return
+	var fy: int = maxi(a_floor, b_floor)
+	var cy: int = fy - 3
+	for tx in range(clampi(x0, 1, width_tiles - 2), clampi(x1, 1, width_tiles - 2)):
+		for dy in range(0, 3):
+			var ty: int = clampi(cy - dy, 1, height_tiles - 2)
+			tiles[ty * width_tiles + tx] = Art.AIR
+		var fy2: int = clampi(cy + 1, 1, height_tiles - 1)
+		tiles[fy2 * width_tiles + tx] = Art.ROCK
+
+func _carve_room(rc: Rect2i, floor_y: int) -> void:
+	var y0: int = clampi(rc.position.y, 0, height_tiles - 1)
+	var y1: int = clampi(rc.position.y + rc.size.y, 0, height_tiles - 1)
+	var x0: int = clampi(rc.position.x, 0, width_tiles - 1)
+	var x1: int = clampi(rc.position.x + rc.size.x, 0, width_tiles - 1)
+	for ty in range(y0, y1):
+		for tx in range(x0, x1):
+			tiles[ty * width_tiles + tx] = Art.AIR
+	# 地板
+	var fy: int = clampi(floor_y, 0, height_tiles - 1)
+	for tx in range(x0, x1):
+		tiles[fy * width_tiles + tx] = Art.ROCK
+
+
+func _link_bands(a: int, b: int, min_links: int) -> void:
+	if a >= band_first.size() or b >= band_first.size():
+		return
+	var lo: Dictionary = band_first[b]
+	var hi: Dictionary = band_last[a]
+	if lo.is_empty() or hi.is_empty():
+		return
+	var lo_rect: Rect2i = lo["rect"]
+	var hi_rect: Rect2i = hi["rect"]
+	for i in range(min_links):
+		var t: float = 0.25 + 0.5 * float(i) / float(maxi(1, min_links - 1))
+		var xa: int = hi_rect.position.x + int(float(hi_rect.size.x) * t)
+		var xb: int = lo_rect.position.x + int(float(lo_rect.size.x) * t)
+		var x: int = clampi(int((xa + xb) / 2), 3, width_tiles - 4)
+		var ya: int = int(hi["floor"])
+		var yb: int = int(lo["floor"])
+		var ytop: int = mini(ya, yb) - 2
+		var ybot: int = maxi(ya, yb) + 1
+		for ty in range(maxi(0, ytop), mini(height_tiles, ybot)):
+			for dx in range(-1, 2):
+				var tx: int = clampi(x + dx, 0, width_tiles - 1)
+				tiles[ty * width_tiles + tx] = Art.AIR
+		# 竖井里放几块落脚平台，方便攀爬
+		var py: int = ybot - 3
+		while py > ytop + 2:
+			for dx in range(-1, 2):
+				var tx2: int = clampi(x + dx, 0, width_tiles - 1)
+				tiles[py * width_tiles + tx2] = Art.PLAT
+			py -= 4
+
+
+func _decorate_room(rc: Rect2i, floor_y: int, idx: int) -> void:
+	# 平台
+	var plats: int = rng.randi_range(0, 2)
+	for i in range(plats):
+		var pw: int = rng.randi_range(3, 6)
+		var px: int = rc.position.x + rng.randi_range(1, maxi(1, rc.size.x - pw - 1))
+		var py: int = floor_y - rng.randi_range(3, 6)
+		if py > rc.position.y + 1:
+			for k in range(pw):
+				var tx: int = clampi(px + k, 0, width_tiles - 1)
+				if py >= 0 and py < height_tiles:
+					tiles[py * width_tiles + tx] = Art.PLAT
+	# 尖刺
+	if idx > 0 and rng.randf() < 0.35:
+		var sw: int = rng.randi_range(2, 4)
+		var sx: int = rc.position.x + rng.randi_range(2, maxi(2, rc.size.x - sw - 2))
+		for k in range(sw):
+			var tx3: int = clampi(sx + k, 0, width_tiles - 1)
+			var sy: int = floor_y - 1
+			if sy >= 0:
+				tiles[sy * width_tiles + tx3] = Art.SPIKE
+	# 火把装饰
+	if rng.randf() < 0.6:
+		var txx: float = float(rc.position.x + rng.randi_range(2, maxi(2, rc.size.x - 2))) * TILE
+		torch_glows.append({"pos": Vector2(txx, float((floor_y - 5) * TILE)), "ph": rng.randf() * TAU})
+	# 道具祭坛
+	if rng.randf() < 0.10 and idx > 0:
+		var ix: float = float(rc.position.x + rng.randi_range(2, maxi(2, rc.size.x - 2))) * TILE + 16.0
+		props.append({"pos": Vector2(ix, float(floor_y * TILE)), "kind": str(ITEM_POOL[rng.randi_range(0, ITEM_POOL.size() - 1)]), "used": false})
+
+
+func _carve_shaft(info: Dictionary) -> void:
+	var rc: Rect2i = info["rect"]
+	var fy: int = int(info["floor"])
+	var sx: int = rc.position.x + rng.randi_range(2, maxi(2, rc.size.x - 8))
+	var w: int = rng.randi_range(5, 7)
+	var h: int = rng.randi_range(4, 6)
+	var shaft := Rect2i(sx, fy - 10 - h, w, h)
+	_carve_room(shaft, shaft.position.y + shaft.size.y + 1)
+	if rng.randf() < 0.7:
+		chests.append({"pos": Vector2(float(shaft.position.x + 2) * TILE + 16.0, float((shaft.position.y + shaft.size.y + 1) * TILE)), "opened": false, "seed": rng.randf()})
+
+
+func _place_random_teleporters() -> void:
+	teleporters.clear()
+	if rooms.size() < 4:
+		return
+	var used: Array = []
+	var want: int = clampi(2 + int(floor_index / 6), 2, 5)
+	for i in range(want):
+		var idx: int = rng.randi_range(1, rooms.size() - 1)
+		var guard: int = 0
+		while used.has(idx) and guard < 12:
+			idx = rng.randi_range(1, rooms.size() - 1)
+			guard += 1
+		if used.has(idx):
+			continue
+		used.append(idx)
+		var rc: Rect2i = rooms[idx]["rect"]
+		var fy: int = int(rooms[idx]["floor"])
+		var tx: int = rc.position.x + rc.size.x / 2
+		teleporters.append({
+			"pos": Vector2(float(tx) * TILE + 16.0, float(fy * TILE)),
+			"label": "房间 %d" % (i + 1),
+			"target": Vector2(float(tx) * TILE + 16.0, float(fy * TILE)),
+		})
+
+
+func _generate_training() -> void:
+	width_tiles = maxi(40, train_len + 24)
+	height_tiles = 40
+	tiles.resize(width_tiles * height_tiles)
+	tiles.fill(Art.ROCK)
+	rooms.clear()
+	band_rooms.clear()
+	band_first.clear()
+	band_last.clear()
+	enemy_spawns.clear()
+	chests.clear()
+	loots.clear()
+	item_drops.clear()
+	teleporters.clear()
+	visited.clear()
+	train_pedestals.clear()
+	# 走廊
+	var fy: int = 30
+	var hall := Rect2i(2, fy - 9, 14, 9)
+	_carve_room(hall, fy)
+	var corr := Rect2i(16, fy - 6, width_tiles - 22, 6)
+	_carve_room(corr, fy)
+	# 大方形木桩房
+	var dw: int = 26
+	var are := Rect2i(width_tiles - dw - 3, fy - 15, dw, 15)
+	_carve_room(are, fy)
+	spawn_point = Vector2(float(hall.position.x + hall.size.x / 2) * TILE, float(fy * TILE))
+	dummy_point = Vector2(float(are.position.x + are.size.x / 2) * TILE, float(fy * TILE))
+	portal_point = dummy_point
+	portal_open = false
+	var hall_info := {"rect": hall, "floor": fy, "band": 0}
+	var corr_info := {"rect": corr, "floor": fy, "band": 0}
+	var are_info := {"rect": are, "floor": fy, "band": 0}
+	rooms = [hall_info, corr_info, are_info]
+	band_rooms = [[hall_info, corr_info, are_info]]
+	band_first = [hall_info]
+	band_last = [are_info]
+	band_count = 1
+	total_enemies = 0
+
+
+func _ensure_room_enemies() -> void:
+	if training or rooms.size() < 2:
+		return
+	if enemy_spawns.size() > 0:
+		return
+	_spawn_legacy_enemies()
+
+
+# ---------------------------------------------------------------- 逻辑
+func set_glow_on(on: bool) -> void:
+	if glow_on == on:
+		return
+	glow_on = on
+	queue_redraw()
+
+
+func level_rect() -> Rect2:
+	return Rect2(0, 0, float(width_tiles) * TILE, float(height_tiles) * TILE)
+
+
+func tile_at(tx: int, ty: int) -> int:
+	if tx < 0 or ty < 0 or tx >= width_tiles or ty >= height_tiles:
+		return Art.ROCK
+	return tiles[ty * width_tiles + tx]
+
+
+func is_solid(tx: int, ty: int) -> bool:
+	if tx < 0 or ty < 0 or tx >= width_tiles or ty >= height_tiles:
+		return true
+	var t: int = tiles[ty * width_tiles + tx]
+	return t == Art.ROCK or t == Art.DOOR
+
+
+func is_platform(tx: int, ty: int) -> bool:
+	if tx < 0 or ty < 0 or tx >= width_tiles or ty >= height_tiles:
+		return false
+	return tiles[ty * width_tiles + tx] == Art.PLAT
+
+
+func hazard_at_point(pos: Vector2) -> bool:
+	var tx: int = int(floor(pos.x / float(TILE)))
+	var ty: int = int(floor(pos.y / float(TILE)))
+	if tx < 0 or ty < 0 or tx >= width_tiles or ty >= height_tiles:
+		return false
+	return tiles[ty * width_tiles + tx] == Art.SPIKE
+
+
+func _box_solid(pos: Vector2, size: Vector2, top_platform: bool) -> bool:
+	var x0: int = int(floor((pos.x - size.x * 0.5) / float(TILE)))
+	var x1: int = int(floor((pos.x + size.x * 0.5 - 0.01) / float(TILE)))
+	var y0: int = int(floor((pos.y - size.y) / float(TILE)))
+	var y1: int = int(floor((pos.y - 0.01) / float(TILE)))
+	for ty in range(y0, y1 + 1):
+		for tx in range(x0, x1 + 1):
+			if is_solid(tx, ty):
+				return true
+			if top_platform and ty == y0 and is_platform(tx, ty):
+				return true
+	return false
+
+
+func try_step_up(pos: Vector2, size: Vector2, dirx: float) -> Vector2:
+	# 尝试抬高 10px 越过小台阶
+	var up: Vector2 = pos + Vector2(0, -10.0)
+	if not _box_solid(up, size, false):
+		return up
+	return pos
+
+
+func move_body(pos: Vector2, size: Vector2, delta: Vector2, drop_through: bool = false) -> Dictionary:
+	var res := {"pos": pos, "on_ground": false, "hit_x": false, "ceiling": false}
+	var p: Vector2 = pos
+	# 水平
+	if absf(delta.x) > 0.0001:
+		var np: Vector2 = p + Vector2(delta.x, 0)
+		if _box_solid(np, size, false):
+			# 细分推进
+			var steps: int = int(ceil(absf(delta.x) / 4.0))
+			var stepx: float = delta.x / float(maxi(1, steps))
+			for i in range(steps):
+				var cand: Vector2 = p + Vector2(stepx, 0)
+				if _box_solid(cand, size, false):
+					res["hit_x"] = true
+					break
+				p = cand
+		else:
+			p = np
+	# 垂直
+	if absf(delta.y) > 0.0001:
+		var steps2: int = int(ceil(absf(delta.y) / 4.0))
+		var stepy: float = delta.y / float(maxi(1, steps2))
+		for i in range(steps2):
+			var cand2: Vector2 = p + Vector2(0, stepy)
+			var use_plat: bool = stepy > 0.0 and not drop_through
+			if _box_solid(cand2, size, use_plat):
+				if stepy > 0.0:
+					res["on_ground"] = true
+				else:
+					res["ceiling"] = true
+				break
+			p = cand2
+	# 落地检测
+	if not bool(res["on_ground"]):
+		var below: Vector2 = p + Vector2(0, 2.0)
+		if _box_solid(below, size, not drop_through):
+			res["on_ground"] = true
+	res["pos"] = p
+	return res
+
+
+func mark_visited(pos: Vector2) -> void:
+	for i in range(rooms.size()):
+		var rc: Rect2i = rooms[i]["rect"]
+		var r := Rect2(float(rc.position.x) * TILE, float(rc.position.y) * TILE, float(rc.size.x) * TILE, float(rc.size.y) * TILE)
+		if r.has_point(pos):
+			if not visited.has(i):
+				visited.append(i)
+			return
+
+
+func update(dt: float) -> void:
+	time += dt
+	_ensure_room_enemies()
+
+
+# ---------------------------------------------------------------- 绘制
+func _draw() -> void:
+	var brick: Color = theme.get("brick", Color(0.18, 0.19, 0.24))
+	var air: Color = theme.get("air", Color(0.05, 0.06, 0.09))
+	var vs: Vector2 = get_viewport_rect().size
+	if vs.x < 1.0 or vs.y < 1.0:
+		vs = view_size
+	var half: Vector2 = vs * 0.5
+	var zoom_factor: float = 1.0
+	var cam_node = get_viewport().get_camera_2d()
+	if cam_node != null:
+		zoom_factor = maxf(0.25, minf(cam_node.zoom.x, cam_node.zoom.y))
+	half /= zoom_factor
+	var margin: int = 40
+	var x0: int = maxi(0, int((cam_pos.x - half.x) / float(TILE)) - margin)
+	var x1: int = mini(width_tiles - 1, int((cam_pos.x + half.x) / float(TILE)) + margin)
+	var y0: int = maxi(0, int((cam_pos.y - half.y) / float(TILE)) - margin)
+	var y1: int = mini(height_tiles - 1, int((cam_pos.y + half.y) / float(TILE)) + margin)
+	# 背景（与原版一致的天空/远景）
+	Art.draw_backdrop(self, cam_pos, view_size, theme, time)
+	draw_rect(Rect2(cam_pos - half, view_size), Color(air.r, air.g, air.b, 0.35))
+	# 瓦片：使用主题石纹贴图（3 种变体随机分布，接近原版质感）
+	var tex_cache: Array = []
+	var wall_kind: String = "wall"
+	for v in range(3):
+		tex_cache.append(Art.stone_tex(theme_idx, wall_kind, v))
+	var plat_tex: Texture2D = Art.stone_tex(theme_idx, "plat", 0)
+	for ty in range(y0, y1 + 1):
+		for tx in range(x0, x1 + 1):
+			var t: int = tiles[ty * width_tiles + tx]
+			if t == Art.AIR:
+				continue
+			var px: float = float(tx * TILE)
+			var py: float = float(ty * TILE)
+			if t == Art.ROCK:
+				var vsel: int = int(abs(tx * 31 + ty * 17)) % 3
+				draw_texture_rect(tex_cache[vsel], Rect2(px, py, TILE, TILE), false)
+				# 顶部高光，让平台边缘更清楚
+				if ty > 0 and tiles[(ty - 1) * width_tiles + tx] == Art.AIR:
+					draw_rect(Rect2(px, py, TILE, 2.0), Color(brick.r + 0.18, brick.g + 0.18, brick.b + 0.20, 0.85))
+			elif t == Art.PLAT:
+				draw_texture_rect(plat_tex, Rect2(px, py + 6.0, TILE, 12.0), false)
+			elif t == Art.SPIKE:
+				draw_colored_polygon(PackedVector2Array([
+					Vector2(px + 4.0, py + TILE), Vector2(px + TILE * 0.5, py + 4.0), Vector2(px + TILE - 4.0, py + TILE)]),
+					Color(0.85, 0.35, 0.38))
+	# 火把
+	if glow_on:
+		for i in range(torch_glows.size()):
+			var tg: Dictionary = torch_glows[i]
+			var tp: Vector2 = tg["pos"]
+			var fl: float = 0.75 + 0.25 * sin(time * 6.0 + float(tg["ph"]))
+			draw_circle(tp, 26.0 * fl, Color(1.0, 0.78, 0.42, 0.10))
+			draw_circle(tp, 5.0, Color(1.0, 0.86, 0.55, 0.9))
+	# 传送门
+	var pc: Vector2 = portal_point + Vector2(0, -26.0)
+	if portal_open:
+		var pcol := Color(0.55, 1.0, 0.75)
+		for r in range(2, 6):
+			draw_circle(pc, float(r) * 8.0, Color(pcol.r, pcol.g, pcol.b, 0.10))
+		draw_circle(pc, 12.0, pcol)
+	else:
+		# 封印状态：暗淡法阵 + 外圈，玩家一眼能看到位置
+		var dim := Color(0.42, 0.55, 0.62, 0.55)
+		draw_arc(pc, 22.0, 0.0, TAU, 24, dim, 2.0)
+		draw_arc(pc, 14.0, 0.0, TAU, 20, Color(dim.r, dim.g, dim.b, 0.35), 1.5)
+		draw_circle(pc, 5.0, Color(dim.r, dim.g, dim.b, 0.6))
+	# 房间传送点
+	for i in range(teleporters.size()):
+		var tp2: Dictionary = teleporters[i]
+		var p2: Vector2 = tp2["pos"]
+		var pulse: float = 0.55 + 0.45 * sin(time * 3.0 + float(i))
+		draw_circle(p2 + Vector2(0, -18.0), 12.0, Color(0.45, 0.85, 1.0, 0.18 * pulse))
+		draw_circle(p2 + Vector2(0, -18.0), 7.0, Color(0.62, 0.92, 1.0, 0.85))
+	# 宝箱
+	for i in range(chests.size()):
+		var ch: Dictionary = chests[i]
+		var cp: Vector2 = ch["pos"]
+		var opened: bool = bool(ch["opened"])
+		var body: Color = Color(0.42, 0.30, 0.18) if not opened else Color(0.24, 0.20, 0.16)
+		draw_rect(Rect2(cp.x - 15.0, cp.y - 22.0, 30.0, 22.0), body)
+		draw_rect(Rect2(cp.x - 15.0, cp.y - 26.0, 30.0, 6.0), Color(0.62, 0.48, 0.24))
+		if not opened:
+			draw_rect(Rect2(cp.x - 3.0, cp.y - 16.0, 6.0, 8.0), Color(1.0, 0.86, 0.42))
+	# 掉落物
+	for i in range(loots.size()):
+		var lt: Dictionary = loots[i]
+		if bool(lt.get("taken", false)):
+			continue
+		var lp: Vector2 = lt["pos"]
+		var lk: String = str(lt.get("kind", "coin"))
+		if lk == "coin":
+			draw_circle(lp + Vector2(0, -10.0), 5.0, Color(1.0, 0.84, 0.32))
+		else:
+			draw_rect(Rect2(lp.x - 6.0, lp.y - 16.0, 12.0, 12.0), Color(0.9, 0.35, 0.42))
+	for i in range(item_drops.size()):
+		var id: Dictionary = item_drops[i]
+		if bool(id.get("taken", false)):
+			continue
+		var ip: Vector2 = id["pos"]
+		draw_circle(ip + Vector2(0, -14.0), 8.0, Color(0.72, 0.92, 1.0, 0.9))
+	# 祭坛道具
+	for i in range(props.size()):
+		var pr2: Dictionary = props[i]
+		if bool(pr2.get("used", false)):
+			continue
+		var pp: Vector2 = pr2["pos"]
+		var col: Color = ITEM_COLS.get(str(pr2["kind"]), Color(0.8, 0.9, 1.0))
+		draw_rect(Rect2(pp.x - 10.0, pp.y - 30.0, 20.0, 30.0), Color(0.16, 0.16, 0.20))
+		draw_circle(pp + Vector2(0, -38.0), 6.0, col)
+	# 训练场展示台
+	if training:
+		for i in range(train_pedestals.size()):
+			var pd: Dictionary = train_pedestals[i]
+			var dp: Vector2 = pd.get("pos", Vector2.ZERO)
+			draw_rect(Rect2(dp.x - 12.0, dp.y - 26.0, 24.0, 26.0), Color(0.18, 0.18, 0.24))
+			draw_rect(Rect2(dp.x - 12.0, dp.y - 28.0, 24.0, 4.0), Color(0.55, 0.85, 1.0))
+
+## 旧版怪物分布：按房间宽度 + 每 2 层 +1，单房间上限 24，全层上限 250
+func _spawn_legacy_enemies() -> void:
+	total_enemies = 0
+	enemy_spawns.clear()
+	for i in range(1, rooms.size()):
+		if total_enemies > 250:
+			break
+		var info2: Dictionary = rooms[i]
+		var rc: Rect2i = info2["rect"]
+		var rfy: int = int(info2["floor"])
+		var count: int = maxi(1, (1 + int(rc.size.x / 8) + int((floor_index - 1) / 2)) * count_mult)
+		if rng.randf() < 0.40:
+			count += 1
+		if rng.randf() < 0.12 + float(floor_index) * 0.02:
+			count += 1
+		if count > 24:
+			count = 24
+		for k in range(count):
+			if total_enemies > 150:
+				break
+			var ex: float = float(rc.position.x + rng.randi_range(1, maxi(1, rc.size.x - 2))) * TILE + 16.0
+			var kind: String = _pick_kind()
+			enemy_spawns.append({"pos": Vector2(ex, float(rfy * TILE)), "kind": kind, "elite": false})
+			total_enemies += 1
+## 在房间内找一根脚下有实体地板的列；找不到就地补地板
+func _find_solid_column(rc: Rect2i, floor_y: int, prefer_x: int) -> int:
+	var fy: int = clampi(floor_y, 0, height_tiles - 1)
+	for dx in range(0, rc.size.x):
+		for sgn in [1, -1]:
+			var tx: int = clampi(prefer_x + dx * sgn, rc.position.x + 1, rc.position.x + rc.size.x - 2)
+			if is_solid(tx, fy) and not is_solid(tx, fy - 1):
+				return tx
+	# 兜底：把首选列补成地板
+	var fallback: int = clampi(prefer_x, 1, width_tiles - 2)
+	tiles[fy * width_tiles + fallback] = Art.ROCK
+	if fy - 1 >= 0:
+		tiles[(fy - 1) * width_tiles + fallback] = Art.AIR
+	return fallback
