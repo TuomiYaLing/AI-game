@@ -587,10 +587,9 @@ func update(dt: float) -> void:
 	_update_book(dt, count_of("book"), mag)
 	_update_pets(dt, phys, mag)
 	_update_stands(dt, phys, mag)
-	# 环绕模型多时降频重绘，避免帧数骤降
+	# 环绕物跟随玩家：每帧重绘（隔帧重绘会让环绕物在移动时抖动）
 	redraw_tick += 1
-	if (not _orbit_heavy()) or (redraw_tick % 2 == 0):
-		queue_redraw()
+	queue_redraw()
 
 
 ## 每帧只遍历一次敌人，返回玩家附近的敌人列表（之后所有环绕/宠物/激光都复用它）
