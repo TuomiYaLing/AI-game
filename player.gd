@@ -495,7 +495,11 @@ func update(dt: float, inp: Dictionary) -> void:
 			var wc: Color = Color(1.0, 0.96, 0.74) if wk == 1 else Color(1.0, 0.38, 0.42)
 			game.fx.spark_spawn(position + Vector2(randf_range(-9.0, 9.0), -6.0), Vector2(0, 1), 1, wc)
 	else:
-		vel.y = minf(MAX_FALL, vel.y + GRAVITY * dt)
+		if wk > 0 and (not on_ground) and roll_time > 0.0:
+			# 飞行途中冲刺：保持高度，不下坠
+			vel.y = move_toward(vel.y, 0.0, 3000.0 * dt)
+		else:
+			vel.y = minf(MAX_FALL, vel.y + GRAVITY * dt)
 
 	# ---- 贴墙下滑
 	if wall_slide > 0.0 and vel.y > 110.0:
