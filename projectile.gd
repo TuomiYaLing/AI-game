@@ -86,7 +86,12 @@ func update(dt: float) -> void:
 			vel = vel.normalized().lerp(want, clampf(3.2 * dt, 0.0, 1.0)).normalized() * spd
 
 	vel.y += gravity * dt
-	position += vel * dt
+	var sweep_from: Vector2 = position
+	var move_vec: Vector2 = vel * dt
+	position += move_vec
+	# 扫掠检测：高速弹幕按 6px 采样，避免"穿过"敌人或墙体
+	var seg_len: float = move_vec.length()
+	var samples: int = maxi(1, int(ceil(seg_len / 6.0)))
 
 	if kind == "knife":
 		spin += dt * 22.0
@@ -96,13 +101,20 @@ func update(dt: float) -> void:
 	else:
 		rotation = vel.angle()
 
-	# 撞墙
-	var tx: int = int(floor(position.x / TILE))
-	var ty: int = int(floor(position.y / TILE))
-	if level.is_solid(tx, ty):
+	# 撞墙（沿路径采样，避免穿过薄墙）
+	var wall_hit: bool = false
+	for si in range(samples):
+		var p_sample: Vector2 = sweep_from + move_vec * (float(si + 1) / float(samples))
+		var sx: int = int(floor(p_sample.x / TILE))
+		var sy: int = int(floor(p_sample.y / TILE))
+		if level.is_solid(sx, sy):
+			position = p_sample
+			wall_hit = true
+			break
+	if wall_hit:
 		if kind == "arrow" and from_player:
 			stuck = true
-			position -= vel * dt
+			position -= vel.normalized() * 6.0
 			game.fx.spark_spawn(position, -vel.normalized(), 5, Color(0.85, 0.85, 0.9))
 		elif kind == "magic":
 			kill_me = true
@@ -124,7 +136,7 @@ func update(dt: float) -> void:
 		kill_me = true
 		return
 
-	# 命中判定
+	# 命中判定（沿路径采样：任何采样点擦到敌人就算命中）
 	if from_player:
 		var enemies: Array = game.enemies
 		for i in range(enemies.size()):
@@ -136,7 +148,7 @@ func update(dt: float) -> void:
 			var eid: int = e.get_instance_id()
 			if hit_set.has(eid):
 				continue
-			if Rect2(position - Vector2(5, 5), Vector2(10, 10)).intersects(e.rect()):
+			if _swept_hits_rect(sweep_from, move_vec, samples, e.rect()):
 				hit_set[eid] = true
 				var res: String = e.hurt(dmg, vel.normalized(), 180.0, 0.16, elem)
 				if status != "" and e != null and is_instance_valid(e) and e.has_method("apply_status"):
@@ -182,6 +194,16 @@ func update(dt: float) -> void:
 				kill_me = true
 			return
 	queue_redraw()
+
+
+## 扫掠命中：沿本帧移动路径采样，任一采样点的 10×10 判定框与目标矩形相交就算命中
+func _swept_hits_rect(from: Vector2, move_vec: Vector2, samples: int, target: Rect2) -> bool:
+	for si in range(samples):
+		var p_sample: Vector2 = from + move_vec * (float(si + 1) / float(samples))
+		if Rect2(p_sample - Vector2(5, 5), Vector2(10, 10)).intersects(target):
+			return true
+	# 起点也检查一次，避免贴脸发射漏判
+	return Rect2(from - Vector2(5, 5), Vector2(10, 10)).intersects(target)
 
 
 func _elem_col() -> Color:
