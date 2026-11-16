@@ -118,10 +118,21 @@ var codex_prev_state := "play"
 # ---- 存档 / 设置 / 拾取询问
 var settings := {}
 var total_playtime := 0.0
+# ---- 王级 BOSS 追踪（血条 / 通关条件）
+var boss_ref = null
+var boss_hp_max := 0.0
+var boss_seen := false
+var near_drop_idx := -1
+var boss_refs: Array = []
+var boss_seen_ids: Dictionary = {}
+var near_chest_idx := -1
+var near_chest_pos := Vector2.ZERO
+var near_drop_pos := Vector2.ZERO
 var run_active := false
 var menu_prev_state := "title"
 var menu_index := 0
 var settings_index := 0
+var settings_top := 0
 var menu_msg := ""
 var pending_weapon := {}
 var weapon_queue: Array = []
@@ -237,6 +248,13 @@ func apply_settings() -> void:
 	# 帧率上限
 	var fi: int = clampi(int(settings.get("fps", 1)), 0, FPS_OPTS.size() - 1)
 	Engine.max_fps = int(FPS_OPTS[fi])
+	# 画面基准固定 1280x720，由引擎拉伸放大到窗口尺寸
+	# （地图绘制按基准分辨率计算可见范围；窗口更大时若不拉伸会出现边缘地形缺失）
+	var win: Window = get_window()
+	if win != null:
+		win.content_scale_size = Vector2i(1280, 720)
+		win.content_scale_mode = Window.CONTENT_SCALE_MODE_CANVAS_ITEMS
+		win.content_scale_aspect = Window.CONTENT_SCALE_ASPECT_KEEP
 	# 画质
 	apply_quality()
 	if hud != null:
@@ -302,7 +320,7 @@ func toggle_fullscreen() -> void:
 
 # ---------------------------------------------------------------- 数值曲线
 func stat_mult() -> float:
-	return pow(2.0, float(int((floor_index - 1) / 5)))
+	return pow(5.0, float(int((floor_index - 1) / 5)))
 
 
 func count_mult() -> int:
@@ -426,16 +444,68 @@ func build_floor(is_title: bool = false) -> void:
 	cam.position = player.position + Vector2(0, -40)
 	cam.offset = Vector2.ZERO
 
-	# 敌人：先按「每层 +10、封顶 350」重排数量（地图代码是编译版，不能改，所以在主控里调整）
+	# 敌人：按「每层 +40、封顶 600」重排数量（地图代码是编译版，不能改，所以在主控里调整）
 	_tune_enemy_count()
 	var mult: float = stat_mult()
 	var spawned: int = 0
+	boss_ref = null
+	boss_hp_max = 0.0
+	boss_seen = false
 	for i in range(dungeon.enemy_spawns.size()):
 		if spawned >= MAX_ENEMIES:
 			break
 		var sp: Dictionary = dungeon.enemy_spawns[i]
-		spawn_enemy(str(sp["kind"]), sp["pos"], bool(sp["elite"]), mult)
+		var kd: String = str(sp["kind"])
+		var epos: Vector2 = sp["pos"]
+		if _is_king_kind(kd):
+			# 王级 BOSS：强制放在最宽房间的中央地面上，避免卡在地图外
+			epos = _boss_safe_pos()
+			var be = spawn_enemy(kd, epos, false, mult)
+			if be != null and is_instance_valid(be):
+				boss_ref = be
+				boss_hp_max = maxf(1.0, be.max_hp)
+			spawned += 1
+			continue
+		spawn_enemy(kd, epos, bool(sp.get("elite", false)), mult)
 		spawned += 1
+	# 每 5 层必定出王级 BOSS：种类随机、数量随机（低概率 2~3 只）
+	boss_refs.clear()
+	boss_seen_ids.clear()
+	boss_ref = null
+	boss_hp_max = 0.0
+	boss_seen = false
+	if not training_mode and (floor_index % 5) == 0:
+		var bkinds2: Array = ["slime_king", "drake_king", "seadrake_king", "slime_queen"]
+		var bcount: int = 1
+		var roll_b: float = randf()
+		if roll_b < 0.12:
+			bcount = 3
+		elif roll_b < 0.35:
+			bcount = 2
+		# BOSS 血量随层数成长：第 5 层 10 万，之后每 5 层 +20 万
+		var boss_ord: int = maxi(1, int(floor_index / 5))
+		var boss_hp: float = 100000.0 + float(boss_ord - 1) * 200000.0
+		for bi2 in range(bcount):
+			var bk: String = str(bkinds2[randi() % bkinds2.size()])
+			var be2 = spawn_enemy(bk, _boss_safe_pos(), false, mult)
+			if be2 != null and is_instance_valid(be2):
+				_apply_king_size(be2)
+				be2.max_hp = boss_hp
+				be2.hp = boss_hp
+				boss_refs.append(be2)
+		if boss_refs.size() > 0:
+			boss_ref = boss_refs[0]
+			boss_hp_max = boss_hp
+	# 兜底：只给还没设置血量的 BOSS 补上（不覆盖已按层数成长好的血量）
+	for bi3 in range(boss_refs.size()):
+		var bb = boss_refs[bi3]
+		if bb != null and is_instance_valid(bb) and not bool(bb.dead):
+			if float(bb.max_hp) <= 0.0:
+				var bo2: int = maxi(1, int(floor_index / 5))
+				var bh2: float = 100000.0 + float(bo2 - 1) * 200000.0
+				bb.max_hp = bh2
+				bb.hp = bh2
+				boss_hp_max = bh2
 	kills = 0
 	# 通关条件：击杀半数，但每层最多 349 只（不超过 349）
 	kills_required = clampi(int(ceil(float(dungeon.total_enemies) * 0.5)), 1, 349)
@@ -461,7 +531,7 @@ func _tune_enemy_count() -> void:
 		return
 	if training_mode:
 		return
-	var want: int = mini(350, 40 + (floor_index - 1) * 40)
+	var want: int = mini(600, 40 + (floor_index - 1) * 40)
 	var rooms_list: Array = dungeon.rooms
 	if rooms_list.size() == 0:
 		return
@@ -961,14 +1031,37 @@ func spawn_dummy() -> void:
 	if enemies.size() > 0:
 		var e = enemies[enemies.size() - 1]
 		if e != null and is_instance_valid(e):
-			e.draw_scale = 1.45
-			e.size = e.size * 1.35
+			# 体型统一放大到「训练场初始房间（384px）的 60%」≈ 230px
+			_apply_king_size(e)
 			e.infinite_hp = true
 			e.frozen = true
 			e.can_split = false
 			e.max_hp = 999999.0
 			e.hp = e.max_hp
 			dummy_ref = e
+			# 木桩是王级时，顶部装备栏上方显示血条（训练场始终显示）
+			if _is_king_kind(dummy_kind):
+				boss_refs.clear()
+				boss_refs.append(e)
+				boss_ref = e
+				boss_hp_max = 999999.0
+				boss_seen = false
+			else:
+				boss_refs.clear()
+				boss_ref = null
+				boss_hp_max = 0.0
+				boss_seen = false
+
+
+## 王级 BOSS 体型：训练场初始房间 12x12 格 = 384px，取其 60% ≈ 230px
+func _apply_king_size(e) -> void:
+	if e == null or not is_instance_valid(e):
+		return
+	var target: float = 230.0
+	var cur: float = maxf(1.0, float(e.size.y))
+	var f: float = target / cur
+	e.size = Vector2(float(e.size.x) * f, float(e.size.y) * f)
+	e.draw_scale = float(e.draw_scale) * f
 
 
 func leave_training() -> void:
@@ -1170,6 +1263,32 @@ func apply_save_data(d: Dictionary) -> void:
 	prev.clear()
 	hud.msg("读取存档 · 第 %d 层" % floor_index, Color(0.8, 0.95, 1.0), 2.4)
 	sfx_play("portal")
+
+
+## 让 HUD 立刻重绘（设置滚动后用）
+func queue_redraw_hud() -> void:
+	if hud != null and is_instance_valid(hud):
+		hud.queue_redraw()
+
+
+## 设置列表滚动：保证选中项始终在可见范围内
+func settings_follow() -> void:
+	var vis: int = 9
+	if hud != null and is_instance_valid(hud):
+		vis = hud.settings_rows_visible(get_viewport_rect().size)
+	if settings_index < settings_top:
+		settings_top = settings_index
+	elif settings_index >= settings_top + vis:
+		settings_top = settings_index - vis + 1
+	settings_top = clampi(settings_top, 0, maxi(0, SETTINGS_ROWS - vis))
+
+
+## 鼠标滚轮 / 手柄十字键滚动设置列表
+func settings_scroll(dir: int) -> void:
+	var vis: int = 9
+	if hud != null and is_instance_valid(hud):
+		vis = hud.settings_rows_visible(get_viewport_rect().size)
+	settings_top = clampi(settings_top + dir, 0, maxi(0, SETTINGS_ROWS - vis))
 
 
 func adjust_setting(dir: int) -> void:
@@ -1478,16 +1597,14 @@ func gather_input() -> Dictionary:
 		k["aim"] = stick_aim_angle
 		stick_aim = true
 		crosshair_world = player.position + Vector2(0, -34.0) + rs.normalized() * 170.0
-	elif mouse_moved:
-		# ③ 鼠标瞄准
+	elif use_mouse and player != null and is_instance_valid(player):
+		# ③ 鼠标瞄准：只要「准星瞄准」开启就持续跟随鼠标（修复准星对准怪物却打偏）
 		stick_aim = false
 		k["aim"] = (mp_now - player.position).angle()
 	else:
 		# 保持上一次朝向，不抖动
 		k["aim"] = stick_aim_angle
-		if not use_auto:
-			stick_aim = false
-			k["aim"] = (mp_now - player.position).angle()
+		stick_aim = false
 	return k
 
 
@@ -1604,8 +1721,10 @@ func _input(event: InputEvent) -> void:
 		if state == "settings":
 			if kc == KEY_UP or kc == KEY_W:
 				settings_index = (settings_index + SETTINGS_ROWS - 1) % SETTINGS_ROWS
+				settings_follow()
 			elif kc == KEY_DOWN or kc == KEY_S:
 				settings_index = (settings_index + 1) % SETTINGS_ROWS
+				settings_follow()
 			elif kc == KEY_LEFT or kc == KEY_A:
 				adjust_setting(-1)
 			elif kc == KEY_RIGHT or kc == KEY_D:
@@ -1790,6 +1909,15 @@ func _input(event: InputEvent) -> void:
 	elif event is InputEventMouseButton and event.pressed:
 		var mp: Vector2 = get_viewport().get_mouse_position()
 		var vs2: Vector2 = get_viewport_rect().size
+		# 设置界面：鼠标滚轮滚动列表
+		if state == "settings" and event.button_index == MOUSE_BUTTON_WHEEL_UP:
+			settings_scroll(-1)
+			queue_redraw_hud()
+			return
+		if state == "settings" and event.button_index == MOUSE_BUTTON_WHEEL_DOWN:
+			settings_scroll(1)
+			queue_redraw_hud()
+			return
 		if state == "shop":
 			if hud != null:
 				var kinds3: Array = ["phys", "magic", "def", "hp", "mana"]
@@ -1844,11 +1972,11 @@ func _input(event: InputEvent) -> void:
 							menu_index = i
 						return
 			return
-func spawn_enemy(kind: String, pos: Vector2, elite: bool = false, mult: float = 1.0) -> void:
+func spawn_enemy(kind: String, pos: Vector2, elite: bool = false, mult: float = 1.0):
 	if dungeon == null:
-		return
+		return null
 	if enemies.size() >= MAX_ENEMIES:
-		return
+		return null
 	var e = EnemyScript.new()
 	e.setup(self, dungeon, kind, pos, elite, mult)
 	entity_holder.add_child(e)
@@ -1858,6 +1986,75 @@ func spawn_enemy(kind: String, pos: Vector2, elite: bool = false, mult: float = 
 		codex.mark("monsters", kind)
 		if elite:
 			codex.mark("monsters", "elite")
+	return e
+
+
+## 是否是王级 BOSS
+func _is_king_kind(kind: String) -> bool:
+	return kind in ["slime_king", "slime_queen", "drake_king", "seadrake_king"]
+
+
+## 任意 BOSS 的显示名（多 BOSS 血条用）
+func boss_display_name(b) -> String:
+	if b == null or not is_instance_valid(b):
+		return "BOSS"
+	var kk: String = str(b.kind)
+	if codex != null:
+		var es2: Array = codex.entries("monsters")
+		for i2 in range(es2.size()):
+			var e2: Dictionary = es2[i2]
+			if str(e2.get("id", "")) == kk:
+				return str(e2.get("name", kk))
+	var map2: Dictionary = {
+		"slime_king": "史莱姆王", "slime_queen": "史莱姆女王",
+		"drake_king": "飞龙王", "seadrake_king": "海龙王",
+	}
+	return str(map2.get(kk, kk))
+
+
+## BOSS 显示名（取图鉴怪物表里的中文名）
+func boss_name() -> String:
+	if boss_ref == null or not is_instance_valid(boss_ref):
+		return "BOSS"
+	var k: String = str(boss_ref.kind)
+	if codex != null:
+		var es: Array = codex.entries("monsters")
+		for i in range(es.size()):
+			var e: Dictionary = es[i]
+			if str(e.get("id", "")) == k:
+				return str(e.get("name", k))
+	# 兜底映射
+	var map: Dictionary = {
+		"slime_king": "史莱姆王", "slime_queen": "史莱姆女王",
+		"drake_king": "飞龙王", "seadrake_king": "海龙王",
+	}
+	return str(map.get(k, k))
+
+
+## 王级 BOSS 的安全落点：地图里最宽的房间中央地面（保证不卡在地图外）
+func _boss_safe_pos() -> Vector2:
+	if dungeon == null or not is_instance_valid(dungeon):
+		return Vector2.ZERO
+	var best: Rect2i = Rect2i()
+	var best_floor: int = 0
+	var rooms_list: Array = dungeon.rooms
+	for i in range(rooms_list.size()):
+		var rc: Rect2i = rooms_list[i]["rect"]
+		if rc.size.x > best.size.x:
+			best = rc
+			best_floor = int(rooms_list[i]["floor"])
+	if best.size.x <= 0:
+		return dungeon.spawn_point
+	var tx: int = best.position.x + int(best.size.x * 0.5)
+	var fy: int = best_floor
+	var p: Vector2 = Vector2(float(tx) * 32.0 + 16.0, float(fy) * 32.0)
+	# 万一该列地板缺失，就地补一块地板，确保 BOSS 站得住
+	var tx2: int = int(p.x / 32.0)
+	var ty2: int = int(p.y / 32.0)
+	if not dungeon.is_solid(tx2, ty2):
+		if ty2 >= 0 and ty2 < dungeon.height_tiles and tx2 >= 0 and tx2 < dungeon.width_tiles:
+			dungeon.tiles[ty2 * dungeon.width_tiles + tx2] = 1
+	return p
 
 
 ## 生成一只召唤物（召唤类武器）
@@ -2081,33 +2278,84 @@ func _check_loot() -> void:
 
 
 func _check_items() -> void:
+	near_drop_idx = -1
+	near_drop_pos = Vector2.ZERO
 	if dungeon == null or player == null or not is_instance_valid(player):
 		return
 	var body: Vector2 = player.position + Vector2(0, -22)
 	var rad: float = pickup_radius()
 	var drops: Array = dungeon.item_drops
+	var best_d: float = rad
 	for i in range(drops.size()):
 		var it: Dictionary = drops[i]
 		if bool(it["taken"]):
 			continue
 		var ip: Vector2 = it["pos"] + Vector2(0, -20)
-		if ip.distance_to(body) < rad:
+		var d: float = ip.distance_to(body)
+		if d >= rad:
+			continue
+		var iid: String = str(it.get("id", ""))
+		# 只有「飞行翅膀」需要交互键（其它遗物仍然自动拾取）
+		if iid.begins_with("wing_"):
+			if d < best_d:
+				best_d = d
+				near_drop_idx = i
+				near_drop_pos = it["pos"]
+		else:
 			it["taken"] = true
-			grant_item(str(it["id"]))
+			grant_item(iid)
+
+
+## 交互键拾取地上的装备 / 遗物
+func pickup_near_drop() -> bool:
+	if near_drop_idx < 0 or dungeon == null:
+		return false
+	var drops: Array = dungeon.item_drops
+	if near_drop_idx >= drops.size():
+		return false
+	var it: Dictionary = drops[near_drop_idx]
+	if bool(it.get("taken", false)):
+		return false
+	it["taken"] = true
+	grant_item(str(it["id"]))
+	near_drop_idx = -1
+	return true
 
 
 func _check_chests() -> void:
+	near_chest_idx = -1
+	near_chest_pos = Vector2.ZERO
 	if dungeon == null or player == null:
 		return
 	var body: Vector2 = player.position + Vector2(0, -20)
+	var best: float = 54.0
 	for i in range(dungeon.chests.size()):
 		var ch: Dictionary = dungeon.chests[i]
 		if bool(ch["opened"]):
 			continue
 		var cp: Vector2 = ch["pos"] + Vector2(0, -20)
-		if cp.distance_to(body) < 54.0:
-			ch["opened"] = true
-			_open_chest(ch["pos"])
+		var d: float = cp.distance_to(body)
+		# 宝箱改为交互键开启（不再自动打开）
+		if d < best:
+			best = d
+			near_chest_idx = i
+			near_chest_pos = ch["pos"]
+
+
+## 交互键开启最近的宝箱
+func open_near_chest() -> bool:
+	if near_chest_idx < 0 or dungeon == null:
+		return false
+	var chests_list: Array = dungeon.chests
+	if near_chest_idx >= chests_list.size():
+		return false
+	var ch: Dictionary = chests_list[near_chest_idx]
+	if bool(ch.get("opened", false)):
+		return false
+	ch["opened"] = true
+	_open_chest(ch["pos"])
+	near_chest_idx = -1
+	return true
 
 
 func _open_chest(pos: Vector2) -> void:
@@ -2201,10 +2449,28 @@ func _check_portal() -> void:
 	if training_mode:
 		dungeon.portal_open = false
 		return
-	dungeon.portal_open = kills >= kills_required
+	# 有王级 BOSS 的关层：必须击杀全部 BOSS 才能开传送门
+	var boss_alive: bool = false
+	for bi4 in range(boss_refs.size()):
+		var bx = boss_refs[bi4]
+		if bx != null and is_instance_valid(bx) and not bool(bx.dead):
+			boss_alive = true
+			break
+	dungeon.portal_open = kills >= kills_required and not boss_alive
+	# BOSS 血条：必须真的打到它（掉血 / 受击闪光）之后才显示
+	for bi5 in range(boss_refs.size()):
+		var by = boss_refs[bi5]
+		if by == null or not is_instance_valid(by) or bool(by.dead):
+			continue
+		if float(by.hp) < float(by.max_hp) - 0.01 or float(by.flash) > 0.0:
+			boss_seen_ids[by.get_instance_id()] = true
+	boss_seen = boss_seen_ids.size() > 0
 	if dungeon.portal_open and not portal_was_open:
 		portal_was_open = true
-		hud.msg("封印解除 · 传送门已开启", Color(0.6, 1.0, 0.82), 2.4)
+		if boss_ref != null and is_instance_valid(boss_ref) and bool(boss_ref.dead):
+			hud.msg("王已陨落 · 传送门已开启", Color(0.75, 0.95, 1.0), 2.6)
+		else:
+			hud.msg("封印解除 · 传送门已开启", Color(0.6, 1.0, 0.82), 2.4)
 		sfx_play("portal")
 		fx.ring_spawn(dungeon.portal_point + Vector2(0, -30), 90.0, Color(0.6, 1.0, 0.85))
 	# 传送门不再自动进入：靠近后按 F 交互（见 try_interact）
@@ -2309,6 +2575,11 @@ func offer_item(id: String) -> void:
 
 ## F 键交互：训练房双向传送门 / 普通模式进入下一关商店
 func try_interact() -> void:
+	# 优先：拾取地上的装备 / 遗物
+	if pickup_near_drop():
+		return
+	if open_near_chest():
+		return
 	if player == null or not is_instance_valid(player):
 		return
 	if dungeon == null or not is_instance_valid(dungeon):
@@ -2553,10 +2824,13 @@ func _poll_pad() -> void:
 		if _pad_edge(JOY_BUTTON_START):
 			state = "pause"
 			sfx_play("ui", 1.0, -8.0)
-		# 手柄交互键（默认 Y）→ 传送门 / 训练场拾取
+		# 手柄交互键：固定支持 Y（若自定义了别的键也一并支持）
 		var ibs: Array = pad_cfg.get("interact", [])
 		var ibtn: int = int(ibs[0]) if ibs.size() > 0 else JOY_BUTTON_Y
-		if _pad_edge(ibtn):
+		var i_hit: bool = _pad_edge(ibtn)
+		if ibtn != JOY_BUTTON_Y:
+			i_hit = _pad_edge(JOY_BUTTON_Y) or i_hit
+		if i_hit:
 			if training_mode:
 				train_try_pickup()
 			try_interact()
@@ -2787,6 +3061,7 @@ func back_to_title() -> void:
 	build_floor(true)
 	title_pan = cam.position.x
 	sfx_play("block", 1.0, -8.0)
+
 
 
 
